@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -9,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/3bl3gamer/tgclient"
-	"github.com/3bl3gamer/tgclient/mtproto"
 	"github.com/ansel1/merry/v2"
 	"github.com/fatih/color"
+	"github.com/shunf4/tgclient"
+	"github.com/shunf4/tgclient/mtproto"
 	"golang.org/x/net/proxy"
 )
 
@@ -540,14 +541,16 @@ func getBestPhotoSize(photo mtproto.TL_photo) (err error, sizeType string, sizeB
 func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) (*TGFileInfo, error) {
 	switch media := mediaTL.(type) {
 	case mtproto.TL_messageMediaPhoto:
-		if _, ok := media.Photo.(mtproto.TL_photoEmpty); ok {
-			log.Error(nil, "got 'photoEmpty' in media of %s #%d", ctxObjName, ctxObjID)
+		if media.Photo == nil {
 			return nil, nil
 		}
-		photo := media.Photo.(mtproto.TL_photo)
+		photo, ok := media.Photo.(mtproto.TL_photo)
+		if !ok {
+			return nil, errors.New("got 'photoEmpty' or unknown photo type in media")
+		}
 		err, sizeType, sizeBytes := getBestPhotoSize(photo)
 		if err != nil {
-			return nil, merry.Prependf(err, "image size of %s #%d", ctxObjName, ctxObjID)
+			return nil, errors.New("failed to get image size: " + err.Error())
 		}
 		return &TGFileInfo{
 			InputLocation: mtproto.TL_inputPhotoFileLocation{
@@ -560,6 +563,7 @@ func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) 
 			DCID:  photo.DCID,
 			FName: "photo.jpg",
 		}, nil
+
 	case mtproto.TL_messageMediaDocument:
 		doc := media.Document.(mtproto.TL_document) //has received TL_documentEmpty here once, after restart is has become TL_document
 		fname := ""
@@ -581,11 +585,11 @@ func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) 
 		}, nil
 	case mtproto.TL_messageMediaStory:
 		if media.Story == nil {
-			return nil, nil
+			return nil, errors.New("story media is nil")
 		}
 		story, ok := media.Story.(mtproto.TL_storyItem)
 		if !ok {
-			return nil, merry.Errorf(mtproto.UnexpectedTL("photoSize", media.Story))
+			return nil, errors.New("unexpected type for story media")
 		}
 		return tgFindMediaFileInfo(story.Media, ctxObjName, ctxObjID)
 	default:

@@ -5,13 +5,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
+
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/3bl3gamer/tgclient/mtproto"
 	"github.com/ansel1/merry/v2"
+	"github.com/shunf4/tgclient/mtproto"
 )
 
 type MediaFileSource byte
@@ -97,14 +97,30 @@ func fnameIDPrefix(id int64) string {
 }
 
 func escapeNameForFS(name string) string {
-	chars := `/:` //TODO: is it enough?
-	if runtime.GOOS == "windows" {
-		chars += `\<>:"|*?`
+	var invalidChars string
+	invalidChars = `<>:"/\|?*` + string(rune(0x00))
+
+	var sb strings.Builder
+	for _, r := range name {
+		if strings.ContainsRune(invalidChars, r) {
+			sb.WriteRune('_')
+		} else {
+			sb.WriteRune(r)
+		}
 	}
-	for _, c := range chars {
-		name = strings.Replace(name, string(c), "_", -1)
+
+	escapedName := sb.String()
+	escapedName = strings.TrimSpace(escapedName) // Remove leading/trailing spaces
+
+	// Handle maximum filename length, trimming if necessary
+	const maxFilenameLength = 255 // This value may vary based on the filesystem
+	if len(escapedName) > maxFilenameLength {
+		escapedName = escapedName[:maxFilenameLength]
 	}
-	return name
+
+	// Additional checks for Windows reserved names can be added here
+
+	return escapedName
 }
 
 func findFPathForID(dirpath string, id int64, defaultName string) (string, error) {

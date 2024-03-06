@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/ansel1/merry/v2"
 )
@@ -167,11 +168,11 @@ type ConfigChatFilterAttrs struct {
 
 func (f ConfigChatFilterAttrs) Match(chat *Chat, file *TGFileInfo) MatchResult {
 	mc := (f.ID == nil || chat.ID == *f.ID) &&
-		(f.Title == nil || chat.Title == *f.Title) &&
-		(f.Username == nil || chat.Username == *f.Username) &&
+		(f.Title == nil || strings.Contains(strings.ToLower(chat.Title), strings.ToLower(*f.Title))) && (f.Username == nil || chat.Username == *f.Username) &&
 		(f.Type == nil || chat.Type == *f.Type)
 	mf := file == nil ||
 		(f.MediaMaxSize == nil || int64(file.Size) <= int64(*f.MediaMaxSize))
+
 	if mc && mf {
 		return MatchTrue
 	}

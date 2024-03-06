@@ -4,3 +4,5 @@
 /config*.json
 /*.session
 /history*/
+.vscode
+.DS_Store
