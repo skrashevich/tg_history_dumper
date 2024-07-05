@@ -69,8 +69,8 @@ func tgConnect(config *Config, logHandler *LogHandler) (*tgclient.TGClient, *mtp
 	cfg := &mtproto.AppConfig{
 		AppID:          config.AppID,
 		AppHash:        config.AppHash,
-		AppVersion:     "0.0.1",
-		DeviceModel:    "Unknown",
+		AppVersion:     "0." + strconv.Itoa(mtproto.TL_Layer),
+		DeviceModel:    "TG History Dumper",
 		SystemVersion:  runtime.GOOS + "/" + runtime.GOARCH,
 		SystemLangCode: "en",
 		LangPack:       "",
@@ -110,13 +110,6 @@ func tgConnect(config *Config, logHandler *LogHandler) (*tgclient.TGClient, *mtp
 		return nil, nil, merry.Wrap(mtproto.WrongRespError(res))
 	}
 	me := users[0].(mtproto.TL_user)
-
-	greenBoldf := color.New(color.FgGreen, color.Bold).SprintfFunc()
-	firstName := mtproto.DerefOr(me.FirstName, "")
-	lastName := mtproto.DerefOr(me.LastName, "")
-	username := mtproto.DerefOr(me.Username, "")
-	log.Info("logged in as %s #%d",
-		greenBoldf("%s (%s)", strings.TrimSpace(firstName+" "+lastName), username), me.ID)
 	return tg, &me, nil
 }
 
@@ -131,14 +124,14 @@ func tgGetMessageID(messageTL mtproto.TL) (int32, error) {
 	}
 }
 
-func tgGetMessageStamp(msgTL mtproto.TL) (int32, error) {
+func tgGetMessageIDStampPeer(msgTL mtproto.TL) (int32, int32, mtproto.TL, error) {
 	switch msg := msgTL.(type) {
 	case mtproto.TL_message:
-		return msg.Date, nil
+		return msg.ID, msg.Date, msg.PeerID, nil
 	case mtproto.TL_messageService:
-		return msg.Date, nil
+		return msg.ID, msg.Date, msg.PeerID, nil
 	default:
-		return 0, merry.Wrap(mtproto.WrongRespError(msg))
+		return 0, 0, nil, merry.Wrap(mtproto.WrongRespError(msg))
 	}
 }
 
@@ -229,64 +222,161 @@ func tgExtractChannelData(channel mtproto.TL_channel, lastMessageID int32) *Chat
 
 func tgLoadChats(tg *tgclient.TGClient) ([]*Chat, error) {
 	chats := make([]*Chat, 0)
-	chatsIDs := make(map[int64]bool)
-	offsetDate := int32(0)
+	// For deduplication. Chat duplicated may be encountered not only on second and subsequent iterations,
+	// but also when user has pinned chats: these chats will be send in the begining of the first chunk (i.e. on "top")
+	// and __also__ the same chats may be send in subsequent chunks as if these chats were not pinned.
+	chatIDs := make(map[int64]bool)
 
-	// We can't fetch regular and pinned chats in one go as it interferes the order of items
-	// in the way offsetDate can't be used properly. So we'll fetch them separately.
-	excludePinned := true
+	iteration := 0
+	maxIterations := 2
+
+	// It is 'min' limit. Because TG can actually send __more__ chats in response.
+	// This happens for small limits and pinned chats: TG always adds some regualr chats after pinned ones.
+	// Though it's not clear how many regular chats there will be. For example,
+	// when there are 3 pinned chats and limit is 1, there will be 7 chats in response: 3 pinned and 4 regular.
+	// If limit is 5, the response will contain 8 chats. If limit is 10 (and 3 still pinned), response will match request (10 chats).
+	minChatsPerSlice := int32(100)
+
+	offsetMessageDate := int32(0)
+	offsetMessageID := int32(0)
+	offsetPeer := mtproto.TL(mtproto.TL_inputPeerEmpty{})
+
 	for {
-		res := tg.SendSyncRetry(mtproto.TL_messages_getDialogs{
-			OffsetPeer:    mtproto.TL_inputPeerEmpty{},
-			OffsetDate:    offsetDate,
-			Limit:         100,
-			ExcludePinned: excludePinned,
+		resTL := tg.SendSyncRetry(mtproto.TL_messages_getDialogs{
+			OffsetDate: offsetMessageDate,
+			OffsetID:   offsetMessageID,
+			OffsetPeer: offsetPeer,
+			Limit:      minChatsPerSlice,
 		}, time.Second, 0, 30*time.Second)
 
-		switch slice := res.(type) {
+		var res mtproto.TL_messages_dialogs
+		switch d := resTL.(type) {
 		case mtproto.TL_messages_dialogs:
-			chats, err := tgExtractDialogsData(slice.Dialogs, slice.Chats, slice.Users)
-			if err != nil {
-				return nil, merry.Wrap(err)
-			}
-			return chats, nil
+			res = d
 		case mtproto.TL_messages_dialogsSlice:
-			group, err := tgExtractDialogsData(slice.Dialogs, slice.Chats, slice.Users)
-			if err != nil {
-				return nil, merry.Wrap(err)
-			}
-			for _, d := range group {
-				if chatsIDs[d.ID] {
-					continue
-				}
-
-				chats = append(chats, d)
-				chatsIDs[d.ID] = true
-			}
-
-			offsetDate, err = tgGetMessageStamp(slice.Messages[len(slice.Messages)-1])
-			if err != nil {
-				return nil, merry.Wrap(err)
-			}
-
-			if len(chats) == int(slice.Count) {
-				return chats, nil
-			}
-			if len(slice.Dialogs) < 100 {
-				if excludePinned {
-					// if the end is reached and there are still some missing chats
-					// it might be because we skipped pinned ones, so we try again with them included
-					excludePinned = false
-				} else {
-					log.Warn("some chats seem missing: got %d in the end, expected %d; retrying from start", len(chats), slice.Count)
-				}
-
-				offsetDate = 0
-			}
+			res.Dialogs, res.Chats, res.Users, res.Messages = d.Dialogs, d.Chats, d.Users, d.Messages
 		default:
-			return nil, merry.Wrap(mtproto.WrongRespError(res))
+			return nil, merry.Wrap(mtproto.WrongRespError(resTL))
+		}
+
+		{
+			s, _ := resTL.(mtproto.TL_messages_dialogsSlice)
+			log.Debug("dialogs chunk, size=%d/%d, messages=%d, iteration=%d",
+				len(res.Dialogs), s.Count, len(res.Messages), iteration)
+		}
+
+		slice, err := tgExtractDialogsData(res.Dialogs, res.Chats, res.Users)
+		if err != nil {
+			return nil, merry.Wrap(err)
+		}
+
+		for _, chat := range slice {
+			if !chatIDs[chat.ID] {
+				if iteration == 0 {
+					chats = append(chats, chat)
+				} else {
+					// On the second and subsequent iterations (if any) we will add only chats with the most recent messages.
+					// It is better to put them at the start of the list (prepend).
+					// It will not match 100% with the sorting on official clients, but such order accuracy is not needed for the dumper.
+					chats = append([]*Chat{chat}, chats...)
+				}
+				chatIDs[chat.ID] = true
+			}
+		}
+
+		if _, ok := resTL.(mtproto.TL_messages_dialogs); ok {
+			break //messages.dialogs contains complete list of all user dialogs
+		}
+		if s, ok := resTL.(mtproto.TL_messages_dialogsSlice); ok && len(chats) == int(s.Count) {
+			break //all dialogs are fetched
+		}
+		if len(res.Dialogs) < int(minChatsPerSlice) {
+			s, _ := resTL.(mtproto.TL_messages_dialogsSlice)
+			log.Debug("last dialog slice size is %d, expexted %d. Looks like we've reached the bottom of dialogs list. "+
+				"But dialogs list is not complete (got only %d of total %d dialogs)",
+				len(res.Dialogs), int(minChatsPerSlice), len(chats), s.Count)
+
+			if iteration < maxIterations-1 {
+				log.Info("looks like dialog list has updated while loading, will retry one more time from the start (check debug log for more info)")
+				offsetMessageDate = 0
+				offsetMessageID = 0
+				offsetPeer = mtproto.TL_inputPeerEmpty{}
+				iteration += 1
+				continue
+			} else {
+				log.Error(nil, "can not load all dialogs: got only %d of total %d; will continue as is but the chat list will be INCOMPLETE",
+					len(chats), s.Count)
+				break
+			}
+		}
+
+		// Making offset values for the next chunk (aka slice).
+		// These values are taken from the last chat in this chunk and from the last message of that chat.
+		// `res.Messages` should contain the last messages, one message for each chat.
+		// If for some reason such message was not found, trying next chat (i.e. iterating from last to first).
+		// Items in `res.Messages` seems always sorted by message date.
+		// But chats are not! Most of them are sorted by their last message date too, __except pinned ones__.
+		// Pinned chats are always returned first in the first chunk.
+		// So `res.Dialogs` and `res.Messages` sorting is dufferent and we can't just take the last `res.Messages` item for offset.
+		offsetMessageFound := false
+		for i := len(slice) - 1; i >= 0; i-- {
+			chat := slice[i]
+
+			msg, found, err := tgFindMessageByChat(res.Messages, chat.Obj)
+			if err != nil {
+				return nil, merry.Wrap(err)
+			}
+
+			if found {
+				id, date, _, err := tgGetMessageIDStampPeer(msg)
+				if err != nil {
+					return nil, merry.Wrap(err)
+				}
+				inputPeer, err := tgMakeInputPeer(chat.Obj)
+				if err != nil {
+					return nil, merry.Wrap(err)
+				}
+				offsetMessageDate = date
+				offsetMessageID = id
+				offsetPeer = inputPeer
+				offsetMessageFound = true
+				break
+			} else {
+				log.Warn("dialogs: could not find last message for '%s' #%d, trying previous dialog", chat.Title, chat.ID)
+			}
+		}
+		if !offsetMessageFound {
+			log.Error(nil, "could not find last message for any of dialogs in dialog slice; will continue as is but the chat list will be INCOMPLETE")
+			break
 		}
 	}
+	return chats, nil
+}
+func tgFindMessageByChat(messages []mtproto.TL, chatTL mtproto.TL) (mtproto.TL, bool, error) {
+	for _, msg := range messages {
+		_, _, msgPeer, err := tgGetMessageIDStampPeer(msg)
+		if err != nil {
+			return nil, false, merry.Wrap(err)
+		}
+
+		switch chat := chatTL.(type) {
+		case mtproto.TL_user:
+			if m, ok := msgPeer.(mtproto.TL_peerUser); ok && m.UserID == chat.ID {
+				return msg, true, nil
+			}
+		case mtproto.TL_chat:
+			if m, ok := msgPeer.(mtproto.TL_peerChat); ok && m.ChatID == chat.ID {
+				return msg, true, nil
+			}
+		case mtproto.TL_channel:
+			if m, ok := msgPeer.(mtproto.TL_peerChannel); ok && m.ChannelID == chat.ID {
+				return msg, true, nil
+			}
+		default:
+			return nil, false, merry.Wrap(mtproto.WrongRespError(chatTL))
+		}
+	}
+	return nil, false, nil
 }
 
 func tgLoadContacts(tg *tgclient.TGClient) (*mtproto.TL_contacts_contacts, error) {
@@ -297,6 +387,14 @@ func tgLoadContacts(tg *tgclient.TGClient) (*mtproto.TL_contacts_contacts, error
 		return nil, merry.Wrap(mtproto.WrongRespError(res))
 	}
 	return &contacts, nil
+}
+
+func tgLogout(tg *tgclient.TGClient) error {
+	res := tg.SendSyncRetry(mtproto.TL_auth_logOut{}, time.Second, 0, 30*time.Second)
+	if _, ok := res.(mtproto.TL_auth_loggedOut); !ok {
+		return merry.New(mtproto.UnexpectedTL("logout", res))
+	}
+	return nil
 }
 
 func tgLoadAuths(tg *tgclient.TGClient) ([]mtproto.TL_authorization, error) {
@@ -502,11 +600,12 @@ type TGFileInfo struct {
 	DCID          int32
 	Size          int64
 	FName         string
+	IndexInMsg    int64 //message with paid content may have multiple media files inside
 }
 
 // getBestPhotoSize returns largest photo size of images.
 // Usually it is the last size-object. But SOMETIMES Sizes aray is reversed.
-func getBestPhotoSize(photo mtproto.TL_photo) (err error, sizeType string, sizeBytes int32) {
+func getBestPhotoSize(photo mtproto.TL_photo) (sizeType string, sizeBytes int32, err error) {
 	maxResolution := int32(0)
 	for _, sizeTL := range photo.Sizes {
 		switch size := sizeTL.(type) {
@@ -538,32 +637,30 @@ func getBestPhotoSize(photo mtproto.TL_photo) (err error, sizeType string, sizeB
 	return
 }
 
-func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) (*TGFileInfo, error) {
+func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName string, ctxObjID int32) ([]TGFileInfo, error) {
 	switch media := mediaTL.(type) {
 	case mtproto.TL_messageMediaPhoto:
-		if media.Photo == nil {
+		if _, ok := media.Photo.(mtproto.TL_photoEmpty); ok {
+			log.Error(nil, "got 'photoEmpty' in media of %s #%d item #%d", ctxObjName, ctxObjID, indexInMsg)
 			return nil, nil
 		}
-		photo, ok := media.Photo.(mtproto.TL_photo)
-		if !ok {
-			return nil, errors.New("got 'photoEmpty' or unknown photo type in media")
-		}
-		err, sizeType, sizeBytes := getBestPhotoSize(photo)
+		photo := media.Photo.(mtproto.TL_photo)
+		sizeType, sizeBytes, err := getBestPhotoSize(photo)
 		if err != nil {
-			return nil, errors.New("failed to get image size: " + err.Error())
+			return nil, merry.Prependf(err, "image size of %s #%d item #%d", ctxObjName, ctxObjID, indexInMsg)
 		}
-		return &TGFileInfo{
+		return []TGFileInfo{{
 			InputLocation: mtproto.TL_inputPhotoFileLocation{
 				ID:            photo.ID,
 				AccessHash:    photo.AccessHash,
 				FileReference: photo.FileReference,
 				ThumbSize:     sizeType,
 			},
-			Size:  int64(sizeBytes),
-			DCID:  photo.DCID,
-			FName: "photo.jpg",
-		}, nil
-
+			Size:       int64(sizeBytes),
+			DCID:       photo.DCID,
+			FName:      "photo.jpg",
+			IndexInMsg: indexInMsg,
+		}}, nil
 	case mtproto.TL_messageMediaDocument:
 		doc := media.Document.(mtproto.TL_document) //has received TL_documentEmpty here once, after restart is has become TL_document
 		fname := ""
@@ -573,16 +670,17 @@ func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) 
 				break
 			}
 		}
-		return &TGFileInfo{
+		return []TGFileInfo{{
 			InputLocation: mtproto.TL_inputDocumentFileLocation{
 				ID:            doc.ID,
 				AccessHash:    doc.AccessHash,
 				FileReference: doc.FileReference,
 			},
-			Size:  doc.Size,
-			DCID:  doc.DCID,
-			FName: fname,
-		}, nil
+			Size:       doc.Size,
+			DCID:       doc.DCID,
+			FName:      fname,
+			IndexInMsg: indexInMsg,
+		}}, nil
 	case mtproto.TL_messageMediaStory:
 		if media.Story == nil {
 			return nil, errors.New("story media is nil")
@@ -591,26 +689,64 @@ func tgFindMediaFileInfo(mediaTL mtproto.TL, ctxObjName string, ctxObjID int32) 
 		if !ok {
 			return nil, errors.New("unexpected type for story media")
 		}
-		return tgFindMediaFileInfo(story.Media, ctxObjName, ctxObjID)
+		return tgFindMediaFileInfos(story.Media, indexInMsg, ctxObjName, ctxObjID)
+	case mtproto.TL_messageMediaPaidMedia:
+		var fileInfos []TGFileInfo
+		for mediaIndex, extMediaTL := range media.ExtendedMedia {
+			switch extMedia := extMediaTL.(type) {
+			case mtproto.TL_messageExtendedMedia:
+				info, err := tgFindMediaFileInfos(extMedia.Media, int64(mediaIndex), ctxObjName, ctxObjID)
+				if err != nil {
+					return nil, merry.Wrap(err)
+				}
+				fileInfos = append(fileInfos, info...)
+			case mtproto.TL_messageExtendedMediaPreview:
+				// no need to save preview: for accessible files there should be a reference to the full file
+				// and for paywall'ed ones there seems only TL_photoStrippedSize with image data
+				// embedded into message (https://core.telegram.org/api/files#stripped-thumbnails)
+			default:
+				log.Error(nil, "unexpected paid media item %#T in media of %s #%d item #%d, skipping",
+					extMediaTL, ctxObjName, ctxObjID, mediaIndex)
+			}
+		}
+		return fileInfos, nil
+	case mtproto.TL_messageMediaUnsupported:
+		log.Error(nil, "media of %s #%d item #%d is insupported, skipping", ctxObjName, ctxObjID, indexInMsg)
+		return nil, nil
+	case mtproto.TL_messageMediaGeo,
+		mtproto.TL_messageMediaContact,
+		mtproto.TL_messageMediaWebPage,
+		mtproto.TL_messageMediaVenue,
+		mtproto.TL_messageMediaGame,
+		mtproto.TL_messageMediaInvoice,
+		mtproto.TL_messageMediaGeoLive,
+		mtproto.TL_messageMediaPoll,
+		mtproto.TL_messageMediaDice,
+		mtproto.TL_messageMediaGiveaway,
+		mtproto.TL_messageMediaGiveawayResults,
+		nil:
+		// nothing to save here
+		return nil, nil
 	default:
+		log.Error(nil, "unexpected media %#T of %s #%d item #%d, skipping", mediaTL, ctxObjName, ctxObjID, indexInMsg)
 		return nil, nil
 	}
 }
 
-func tgFindMessageMediaFileInfo(msgTL mtproto.TL) (*TGFileInfo, error) {
+func tgFindMessageMediaFileInfos(msgTL mtproto.TL) ([]TGFileInfo, error) {
 	msg, ok := msgTL.(mtproto.TL_message)
 	if !ok {
 		return nil, nil
 	}
-	return tgFindMediaFileInfo(msg.Media, "message", msg.ID)
+	return tgFindMediaFileInfos(msg.Media, 0, "message", msg.ID)
 }
 
-func tgFindStoryMediaFileInfo(storyTL mtproto.TL) (*TGFileInfo, error) {
+func tgFindStoryMediaFileInfos(storyTL mtproto.TL) ([]TGFileInfo, error) {
 	story, ok := storyTL.(mtproto.TL_storyItem)
 	if !ok {
 		return nil, nil
 	}
-	return tgFindMediaFileInfo(story.Media, "story", story.ID)
+	return tgFindMediaFileInfos(story.Media, 0, "story", story.ID)
 }
 
 /*

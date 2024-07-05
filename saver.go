@@ -123,9 +123,30 @@ func escapeNameForFS(name string) string {
 	return escapedName
 }
 
+func clampNameForFS(name string) string {
+	// Most file systems limit file name length by 255 characters or 255 bytes.
+	// https://en.wikipedia.org/wiki/Comparison_of_file_systems#Limits
+	// Assuming FS encoding to be UTF-8 and limiting name to 255 bytes.
+	maxByteLen := 255
+	ellipsis := "…"
+
+	if len(name) <= maxByteLen {
+		return name
+	}
+
+	splitIndex := 0
+	for index := range name {
+		if index > maxByteLen-len(ellipsis) {
+			break
+		}
+		splitIndex = index
+	}
+	return name[:splitIndex] + ellipsis
+}
+
 func findFPathForID(dirpath string, id int64, defaultName string) (string, error) {
 	fnamePrefix := fnameIDPrefix(id)
-	correctFPath := dirpath + "/" + fnamePrefix + escapeNameForFS(defaultName)
+	correctFPath := dirpath + "/" + clampNameForFS(fnamePrefix+escapeNameForFS(defaultName))
 
 	entries, err := os.ReadDir(dirpath)
 	if os.IsNotExist(err) {
@@ -210,7 +231,7 @@ func (s JSONFilesHistorySaver) chatStoriesFPath(chat *Chat) (string, error) {
 	return findFPathForID(s.Dirpath+"/stories", int64(chat.ID), chat.Title)
 }
 
-func (s JSONFilesHistorySaver) MessageFileFPath(chat *Chat, msgID int32, fname string, mediaSource MediaFileSource) (string, error) {
+func (s JSONFilesHistorySaver) MessageFileFPath(chat *Chat, msgID int32, fname string, indexInMsg int64, mediaSource MediaFileSource) (string, error) {
 	baseDirPath := s.Dirpath + "/files"
 	if mediaSource == StoryMediaFile {
 		baseDirPath += "/stories"
@@ -220,10 +241,14 @@ func (s JSONFilesHistorySaver) MessageFileFPath(chat *Chat, msgID int32, fname s
 		return "", merry.Wrap(err)
 	}
 	suffix := "Media"
+	if indexInMsg != 0 { //message with paid content may have multiple media files inside, will name them _Media_, _Media1_, _Media2_, etc.
+		suffix += strconv.FormatInt(indexInMsg, 10)
+	}
 	if fname != "" {
 		suffix += "_" + fname
 	}
-	return dirPath + "/" + fnameIDPrefix(int64(msgID)) + escapeNameForFS(suffix), nil
+	fnamePrefix := fnameIDPrefix(int64(msgID))
+	return dirPath + "/" + clampNameForFS(fnamePrefix+escapeNameForFS(suffix)), nil
 }
 
 func (s JSONFilesHistorySaver) makeDir(dirpath string) error {
@@ -354,7 +379,7 @@ func (s JSONFilesHistorySaver) loadChats() error {
 	})
 }
 
-func (s JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
+func (s *JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
 	if s.usersData == nil {
 		s.usersData = make(map[int64]*UserData)
 		if err := s.loadUsers(); err != nil {
@@ -391,7 +416,7 @@ func (s JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
 	return nil
 }
 
-func (s JSONFilesHistorySaver) SaveRelatedChats(chats []mtproto.TL) error {
+func (s *JSONFilesHistorySaver) SaveRelatedChats(chats []mtproto.TL) error {
 	if s.chatsData == nil {
 		s.chatsData = make(map[int64]*ChatData)
 		if err := s.loadChats(); err != nil {
@@ -500,7 +525,7 @@ func (s JSONFilesHistorySaver) SaveAccount(me mtproto.TL_user) error {
 
 func (s JSONFilesHistorySaver) appendRecordsWithRelatedMedia(
 	fpath string, messages []mtproto.TL,
-	chat *Chat, mediaSource MediaFileSource, fileInfoFunc func(item mtproto.TL) (*TGFileInfo, error),
+	chat *Chat, mediaSource MediaFileSource, fileInfosFunc func(item mtproto.TL) ([]TGFileInfo, error),
 ) error {
 	file, err := s.openForAppend(fpath)
 	if err != nil {
@@ -514,12 +539,12 @@ func (s JSONFilesHistorySaver) appendRecordsWithRelatedMedia(
 		msgMap := tgObjToMap(msg)
 		msgMap["_TL_LAYER"] = mtproto.TL_Layer
 		if s.requestFileFunc != nil {
-			fileInfo, err := fileInfoFunc(msg)
+			fileInfos, err := fileInfosFunc(msg)
 			if err != nil {
 				return merry.Wrap(err)
 			}
-			if fileInfo != nil {
-				if err := s.requestFileFunc(chat, fileInfo, msgMap["ID"].(int32), mediaSource); err != nil {
+			for _, fileInfo := range fileInfos {
+				if err := s.requestFileFunc(chat, &fileInfo, msgMap["ID"].(int32), mediaSource); err != nil {
 					return merry.Wrap(err)
 				}
 			}
@@ -540,7 +565,7 @@ func (s JSONFilesHistorySaver) SaveMessages(chat *Chat, messages []mtproto.TL) e
 	if err != nil {
 		return merry.Wrap(err)
 	}
-	err = s.appendRecordsWithRelatedMedia(messagesFPath, messages, chat, MessageMediaFile, tgFindMessageMediaFileInfo)
+	err = s.appendRecordsWithRelatedMedia(messagesFPath, messages, chat, MessageMediaFile, tgFindMessageMediaFileInfos)
 	return merry.Wrap(err)
 }
 
@@ -549,7 +574,7 @@ func (s JSONFilesHistorySaver) SaveStories(chat *Chat, stories []mtproto.TL) err
 	if err != nil {
 		return merry.Wrap(err)
 	}
-	err = s.appendRecordsWithRelatedMedia(storiesFPath, stories, chat, StoryMediaFile, tgFindStoryMediaFileInfo)
+	err = s.appendRecordsWithRelatedMedia(storiesFPath, stories, chat, StoryMediaFile, tgFindStoryMediaFileInfos)
 	return merry.Wrap(err)
 }
 
