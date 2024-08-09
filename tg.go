@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -682,11 +681,11 @@ func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName strin
 		}}, nil
 	case mtproto.TL_messageMediaStory:
 		if media.Story == nil {
-			return nil, errors.New("story media is nil")
+			return nil, nil
 		}
 		story, ok := media.Story.(mtproto.TL_storyItem)
 		if !ok {
-			return nil, errors.New("unexpected type for story media")
+			return nil, merry.Errorf(mtproto.UnexpectedTL("photoSize", media.Story))
 		}
 		return tgFindMediaFileInfos(story.Media, indexInMsg, ctxObjName, ctxObjID)
 	case mtproto.TL_messageMediaPaidMedia:
