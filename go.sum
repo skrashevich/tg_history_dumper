@@ -1,5 +1,5 @@
-github.com/3bl3gamer/tgclient v0.183.0 h1:B6TGuJFu45cEiw7cXw+WVUVEp3NXd2MXZggrmzbY6Wo=
-github.com/3bl3gamer/tgclient v0.183.0/go.mod h1:53s1NaSeJEbsDxFSdseiduYuM+ULGCgxLsx3yeysI9A=
+github.com/3bl3gamer/tgclient v0.185.0 h1:H92fh3OJcBz/PKgC3MaTzTbLWpS/p1ZTJ/tuQpv+HOg=
+github.com/3bl3gamer/tgclient v0.185.0/go.mod h1:zO2Bp4xeJuJdIijG1lw56tILudwF00BYmdbySyhoIgc=
 github.com/ansel1/merry/v2 v2.2.1 h1:PJpynLFvIpJkn8ZGgNHLq332zIyBc/wTqp3o42ZpWdU=
 github.com/ansel1/merry/v2 v2.2.1/go.mod h1:K9lCkM6tJ8s7LQVQ0ZmZ0WrB3BCyr+ZDzoqotzzoxpI=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
@@ -17,8 +17,6 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/shunf4/tgclient v0.167.2-0.20240113102131-36fdf019eeb8 h1:VCuFSNhOZYNRdQKiq3DmpuVfgmi8BLGWefz4vp8x8e0=
-github.com/shunf4/tgclient v0.167.2-0.20240113102131-36fdf019eeb8/go.mod h1:NtTlOuCmKBCJRwYovEnKBMnvCPPufP/FussXS3es6Us=
 github.com/stretchr/testify v1.8.3 h1:RP3t2pwF7cMEbC1dqtB6poj3niw/9gnV4Cjg5oW5gtY=
 github.com/stretchr/testify v1.8.3/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo=
 golang.org/x/crypto v0.25.0 h1:ypSNr+bnYL2YhwoMt2zPxHFmbAN1KZs/njMG3hxUp30=
