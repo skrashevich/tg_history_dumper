@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/3bl3gamer/tgclient/mtproto"
 	"github.com/ansel1/merry/v2"
+	"github.com/valyala/fastjson"
 )
 
 type MediaFileSource byte
@@ -248,6 +251,8 @@ type HistorySaver interface {
 
 type JSONFilesHistorySaver struct {
 	Dirpath         string
+	usersReader     *JSONRecordsReader[UserData]
+	chatsReader     *JSONRecordsReader[ChatData]
 	usersData       map[int64]*UserData
 	chatsData       map[int64]*ChatData
 	requestFileFunc SaveFileCallbackFunc
@@ -392,49 +397,33 @@ func (s JSONFilesHistorySaver) GetLastStoryID(chat *Chat) (int32, error) {
 	return s.getLastLineID(chatFPath)
 }
 
-func loadRelated[T any](fpath string, f func(T)) error {
-	file, err := os.Open(fpath)
-	if os.IsNotExist(err) {
-		return nil
+func findOrReadRelated[T UserData | ChatData](itemsMap map[int64]*T, itemsReader *JSONRecordsReader[T], id int64) (*T, bool, error) {
+	item, exists := itemsMap[id]
+	if exists {
+		return item, true, nil
 	}
+
+	it, exists, err := itemsReader.Read(id)
 	if err != nil {
-		return merry.Wrap(err)
+		return nil, false, merry.Wrap(err)
 	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	for {
-		var obj T
-		err := decoder.Decode(&obj)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return merry.Wrap(err)
-		}
-		f(obj)
+	if exists {
+		itemsMap[id] = &it
+		return &it, true, nil
 	}
-	return nil
-}
 
-func (s JSONFilesHistorySaver) loadUsers() error {
-	return loadRelated(s.usersFPath(), func(user UserData) {
-		s.usersData[user.ID] = &user
-	})
-}
-
-func (s JSONFilesHistorySaver) loadChats() error {
-	return loadRelated(s.chatsFPath(), func(chat ChatData) {
-		s.chatsData[chat.ID] = &chat
-	})
+	return nil, false, nil
 }
 
 func (s *JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
-	if s.usersData == nil {
-		s.usersData = make(map[int64]*UserData)
-		if err := s.loadUsers(); err != nil {
+	if s.usersReader == nil {
+		s.usersReader = NewJSONRecordsReader[UserData](s.usersFPath())
+		if err := s.usersReader.UpdateOffsets(); err != nil {
 			return merry.Wrap(err)
 		}
+	}
+	if s.usersData == nil {
+		s.usersData = make(map[int64]*UserData)
 	}
 
 	var encoder *json.Encoder
@@ -444,7 +433,10 @@ func (s *JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
 			return merry.Errorf(mtproto.UnexpectedTL("user", userTL))
 		}
 
-		user, exists := s.usersData[tgUser.ID]
+		user, exists, err := findOrReadRelated(s.usersData, s.usersReader, tgUser.ID)
+		if err != nil {
+			return merry.Wrap(err)
+		}
 		if !exists || user.IsUpdatedBy(&tgUser) {
 			newUser := NewUserDataFromTG(tgUser)
 
@@ -467,11 +459,14 @@ func (s *JSONFilesHistorySaver) SaveRelatedUsers(users []mtproto.TL) error {
 }
 
 func (s *JSONFilesHistorySaver) SaveRelatedChats(chats []mtproto.TL) error {
-	if s.chatsData == nil {
-		s.chatsData = make(map[int64]*ChatData)
-		if err := s.loadChats(); err != nil {
+	if s.chatsReader == nil {
+		s.chatsReader = NewJSONRecordsReader[ChatData](s.chatsFPath())
+		if err := s.chatsReader.UpdateOffsets(); err != nil {
 			return merry.Wrap(err)
 		}
+	}
+	if s.chatsData == nil {
+		s.chatsData = make(map[int64]*ChatData)
 	}
 
 	var encoder *json.Encoder
@@ -492,7 +487,10 @@ func (s *JSONFilesHistorySaver) SaveRelatedChats(chats []mtproto.TL) error {
 			return merry.Wrap(mtproto.WrongRespError(chatTL))
 		}
 
-		chat, exists := s.chatsData[newChat.ID]
+		chat, exists, err := findOrReadRelated(s.chatsData, s.chatsReader, newChat.ID)
+		if err != nil {
+			return merry.Wrap(err)
+		}
 		if !exists || chat.IsUpdatedBy(newChat, chatIsMin) {
 			newChat.UpdatedAt = time.Now()
 
@@ -575,7 +573,7 @@ func (s JSONFilesHistorySaver) SaveAccount(me mtproto.TL_user) error {
 
 func (s JSONFilesHistorySaver) appendRecordsWithRelatedMedia(
 	fpath string, messages []mtproto.TL,
-	chat *Chat, mediaSource MediaFileSource, fileInfosFunc func(item mtproto.TL) ([]TGFileInfo, error),
+	chat *Chat, mediaSource MediaFileSource, fileInfosFunc FileInfosExtractorFunc,
 ) error {
 	file, err := s.openForAppend(fpath)
 	if err != nil {
@@ -707,4 +705,224 @@ func (s *JSONFilesHistorySaver) ReadSavedChatFilesList(chatID int64) ([]SavedFil
 		})
 	}
 	return items, nil
+}
+
+type JSONRecordPos struct {
+	Offset, Length int64
+}
+
+// JSONRecordsReader reads JSONL files (like history/users),
+// maps item ID to offset in file and allows fast subsequent read of full item data by ID.
+//
+// IDs may be not unique. For each ID the last offset is recorded.
+//
+// Assumes each item has an integer "ID" attr that fits into int64.
+//
+// Assumes each item's data is encoded as single JSON line with '\n' in the end (even after the last line).
+//
+// Assumes file can be only appended. It is not detected automatically but UpdateOffsets()
+// will continue reading from previous position (i.e. it will not re-read while file).
+type JSONRecordsReader[T any] struct {
+	fpath      string
+	readOffset int64
+	idToPos    map[int64]JSONRecordPos
+}
+
+func NewJSONRecordsReader[T any](fpath string) *JSONRecordsReader[T] {
+	return &JSONRecordsReader[T]{
+		fpath:   fpath,
+		idToPos: make(map[int64]JSONRecordPos),
+	}
+}
+
+func (r *JSONRecordsReader[T]) Read(id int64) (T, bool, error) {
+	var value T
+
+	pos, ok := r.idToPos[id]
+	if !ok {
+		return value, false, nil
+	}
+
+	f, err := os.Open(r.fpath)
+	if err != nil {
+		return value, false, merry.Wrap(err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(pos.Offset, io.SeekStart); err != nil {
+		return value, false, merry.Wrap(err)
+	}
+
+	buf := make([]byte, pos.Length)
+	if _, err := f.Read(buf); err != nil {
+		return value, false, merry.Wrap(err)
+	}
+
+	if err := json.Unmarshal(buf, &value); err != nil {
+		return value, false, merry.Wrap(err)
+	}
+
+	return value, true, nil
+}
+
+func (r *JSONRecordsReader[T]) UpdateOffsets() error {
+	f, err := os.Open(r.fpath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return merry.Wrap(err)
+	}
+	defer f.Close()
+
+	if r.readOffset > 0 {
+		if _, err := f.Seek(r.readOffset, io.SeekStart); err != nil {
+			return merry.Wrap(err)
+		}
+	}
+
+	// for big files (~85MB history/users) fastjson v.GetInt64("ID") is much faster than json.Unmarshal(struct{ ID int64 }):
+	//                                   read w/o parse   fastjson   encoding/json
+	// cold read (file not in cache)   |         200ms  |   200ms  |       700ms
+	// file is already in memory cahce |          20ms  |    90ms  |       500ms
+
+	scanner := bufio.NewScanner(f)
+	scanner.Split(ScanFullLines)
+
+	var p fastjson.Parser
+	for scanner.Scan() {
+		buf := scanner.Bytes()
+		if len(buf) > 0 && buf[len(buf)-1] != '\n' {
+			break //Last line does not end with newline. File is either being written or is malformed. Stopping scan.
+		}
+
+		v, err := p.ParseBytes(buf)
+		if err != nil {
+			return merry.Wrap(err)
+		}
+		id := v.GetInt64("ID")
+		r.idToPos[id] = JSONRecordPos{Offset: r.readOffset, Length: int64(len(buf))}
+
+		r.readOffset += int64(len(buf))
+	}
+
+	if err := scanner.Err(); err != nil {
+		return merry.Wrap(err)
+	}
+	return nil
+}
+
+// JSONMessageReader reads range of JSONL messages.
+// It caches message file positions so repetitive reads
+// of same or previous messages will be faster.
+//
+// Assumes each messages's data is encoded as single JSON line with '\n' in the end (even after the last line).
+//
+// Assumes file can be only appended.
+type JSONMessageReader struct {
+	fpath      string
+	endOffsets []int64 //message_number -> file_offset_of_data_end
+}
+
+func NewJSONMessageReader(fpath string) *JSONMessageReader {
+	return &JSONMessageReader{fpath: fpath}
+}
+
+// Read reads limit messages starting from offset message.
+//
+// First message has offset=0.
+//
+// If limit=0, reads all messages till the end (offset still applies).
+func (r *JSONMessageReader) Read(offset, limit int) ([]map[string]interface{}, bool, error) {
+	f, err := os.Open(r.fpath)
+	if err != nil {
+		return nil, false, merry.Wrap(err)
+	}
+	defer f.Close()
+
+	curLineIndex := offset
+	if curLineIndex > len(r.endOffsets) {
+		curLineIndex = len(r.endOffsets)
+	}
+	curLineEndOffset := int64(0)
+	if curLineIndex > 0 {
+		curLineEndOffset = r.endOffsets[curLineIndex-1]
+		if _, err := f.Seek(curLineEndOffset, io.SeekStart); err != nil {
+			return nil, false, merry.Wrap(err)
+		}
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Split(ScanFullLines)
+	// Usually message lines are less than 1KB in size, but some messages (especially with Instan View pages)
+	// can be very large:
+	// one message with a link to https://ru.wikipedia.org/wiki/Кириллица_в_Юникоде took 508KB in JSON
+	// and other msg with a link to https://en.m.wikipedia.org/wiki/X11_color_names took 576KB
+	scanner.Buffer(make([]byte, 1024), 4*1024*1024)
+
+	hasMore := false
+	var messages []map[string]interface{}
+	for scanner.Scan() {
+		buf := scanner.Bytes()
+		if len(buf) > 0 && buf[len(buf)-1] != '\n' {
+			break //Last line does not end with newline. File is either being written or is malformed. Stopping scan.
+		}
+
+		shouldAppend := curLineIndex >= offset
+
+		curLineIndex += 1
+		curLineEndOffset += int64(len(buf))
+		if curLineIndex-1 == len(r.endOffsets) {
+			r.endOffsets = append(r.endOffsets, curLineEndOffset)
+		}
+
+		// reading limit+1 lines, this last line won't be added to messages, but will set hasMore flag
+		if limit > 0 && len(messages) == limit {
+			hasMore = true
+			break
+		}
+
+		if shouldAppend {
+			var msg map[string]interface{}
+			if err := json.Unmarshal(buf, &msg); err != nil {
+				return nil, false, merry.Wrap(err)
+			}
+			messages = append(messages, msg)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, false, merry.Wrap(err)
+	}
+	return messages, hasMore, nil
+}
+
+func (r *JSONMessageReader) EstimateMessagesCount() (int64, error) {
+	if len(r.endOffsets) == 0 {
+		return -1, nil
+	}
+
+	stat, err := os.Stat(r.fpath)
+	if err != nil {
+		return -1, merry.Wrap(err)
+	}
+
+	readCount := int64(len(r.endOffsets))
+	lastReadOffset := r.endOffsets[len(r.endOffsets)-1]
+
+	return readCount + (stat.Size()-lastReadOffset)*readCount/lastReadOffset, nil
+}
+
+// ScanFullLines is a line split function like bufio.ScanLines but preserves newlines.
+func ScanFullLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[0 : i+1], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }

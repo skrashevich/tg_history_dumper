@@ -155,6 +155,18 @@ a.block_link:hover {
 .message .userpic .initials {
     font-size: 16px;
 }
+.message .date {
+    position: relative;
+}
+.message .date .msg-id {
+    position: absolute;
+    right: 100%;
+    top: 0;
+    margin-right: 8px;
+}
+.message:not(:hover) .date .msg-id {
+    display: none;
+}
 .default {
     padding: 10px;
 }
@@ -169,6 +181,9 @@ a.block_link:hover {
 .default .from_name .details {
     font-weight: normal;
 }
+.body {
+    position: relative; /* for .service .text width:100% */
+}
 .default .body {
     margin-left: 60px;
 }
@@ -179,6 +194,8 @@ a.block_link:hover {
     text-align: start;
 }
 .service .text {
+    position: absolute;
+    width: 100%;
     text-align: center;
 }
 .service .text .bubble {
@@ -230,6 +247,10 @@ a.block_link:hover {
 .default .photo,
 .default .sticker {
     display: block;
+}
+
+.pagination-range {
+    text-align: center;
 }
 
 .pagination {

@@ -15,6 +15,21 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+type FileInfosExtractorFunc = func(item mtproto.TL) ([]TGFileInfo, error)
+
+var skipPendingWebpagePhotos bool = false
+
+const skipPendingWebpagePhotosHelp = "Sometimes there are preview images for links in chats.\n" +
+	"Sometimes (rarely) these previews have status 'pending'.\n" +
+	"This status means that preview will be ready soon.\n" +
+	"But the dumper can not (yet) re-fetch same messages again.\n" +
+	"So, as a temporary workaround, the dumper will abort with error\n" +
+	"and expect you or outer script to restart with a short delay.\n" +
+	"But, if you prefer to skip some link previews (instead of aborting with error),\n" +
+	"add -skip-pending-webpage-photos flag."
+
+const videoCoverFileSuffix = "video_cover.jpg"
+
 type ChatType int8
 
 const (
@@ -116,6 +131,12 @@ func tgGetMessageID(messageTL mtproto.TL) (int32, error) {
 	case mtproto.TL_message:
 		return message.ID, nil
 	case mtproto.TL_messageService:
+		return message.ID, nil
+	case mtproto.TL_messageEmpty:
+		// Sometimes the first message (#1) in channel is TL_messageEmpty
+		// (instead of service message with action:TL_messageActionChannelCreate).
+		// Maybe it was somehow deleted? For example, in @rutheniumos
+		// the first visible mesage is https://t.me/rutheniumos/7 and #1 is "empty".
 		return message.ID, nil
 	default:
 		return 0, merry.Wrap(mtproto.WrongRespError(messageTL))
@@ -635,30 +656,43 @@ func getBestPhotoSize(photo mtproto.TL_photo) (sizeType string, sizeBytes int32,
 	return
 }
 
+func tgFindPhotoFileInfo(photoTL mtproto.TL, fname string, indexInMsg int64, ctxLocationInObj, ctxObjName string, ctxObjID int32) (TGFileInfo, bool, error) {
+	if _, ok := photoTL.(mtproto.TL_photoEmpty); ok {
+		log.Error(nil, "got 'photoEmpty' in %s of %s #%d item #%d", ctxLocationInObj, ctxObjName, ctxObjID, indexInMsg)
+		return TGFileInfo{}, false, nil
+	}
+
+	photo := photoTL.(mtproto.TL_photo)
+	sizeType, sizeBytes, err := getBestPhotoSize(photo)
+	if err != nil {
+		return TGFileInfo{}, false, merry.Prependf(err, "image size of %s #%d item #%d", ctxObjName, ctxObjID, indexInMsg)
+	}
+
+	return TGFileInfo{
+		InputLocation: mtproto.TL_inputPhotoFileLocation{
+			ID:            photo.ID,
+			AccessHash:    photo.AccessHash,
+			FileReference: photo.FileReference,
+			ThumbSize:     sizeType,
+		},
+		Size:       int64(sizeBytes),
+		DCID:       photo.DCID,
+		FName:      fname,
+		IndexInMsg: indexInMsg,
+	}, true, nil
+}
+
 func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName string, ctxObjID int32) ([]TGFileInfo, error) {
 	switch media := mediaTL.(type) {
 	case mtproto.TL_messageMediaPhoto:
-		if _, ok := media.Photo.(mtproto.TL_photoEmpty); ok {
-			log.Error(nil, "got 'photoEmpty' in media of %s #%d item #%d", ctxObjName, ctxObjID, indexInMsg)
-			return nil, nil
-		}
-		photo := media.Photo.(mtproto.TL_photo)
-		sizeType, sizeBytes, err := getBestPhotoSize(photo)
+		fileInfo, found, err := tgFindPhotoFileInfo(media.Photo, "photo.jpg", indexInMsg, "media", ctxObjName, ctxObjID)
 		if err != nil {
-			return nil, merry.Prependf(err, "image size of %s #%d item #%d", ctxObjName, ctxObjID, indexInMsg)
+			return nil, merry.Wrap(err)
 		}
-		return []TGFileInfo{{
-			InputLocation: mtproto.TL_inputPhotoFileLocation{
-				ID:            photo.ID,
-				AccessHash:    photo.AccessHash,
-				FileReference: photo.FileReference,
-				ThumbSize:     sizeType,
-			},
-			Size:       int64(sizeBytes),
-			DCID:       photo.DCID,
-			FName:      "photo.jpg",
-			IndexInMsg: indexInMsg,
-		}}, nil
+		if found {
+			return []TGFileInfo{fileInfo}, nil
+		}
+		return nil, nil
 	case mtproto.TL_messageMediaDocument:
 		doc := media.Document.(mtproto.TL_document) //has received TL_documentEmpty here once, after restart is has become TL_document
 		fname := ""
@@ -668,7 +702,24 @@ func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName strin
 				break
 			}
 		}
-		return []TGFileInfo{{
+		var fileInfos []TGFileInfo
+		if media.VideoCover != nil {
+			fileInfo, found, err := tgFindPhotoFileInfo(media.VideoCover, videoCoverFileSuffix, indexInMsg, "document.VideoCover", ctxObjName, ctxObjID)
+			if err != nil {
+				return nil, merry.Wrap(err)
+			}
+			if found {
+				fileInfos = append(fileInfos, fileInfo)
+			}
+		}
+		// There may be also a media.AltDocuments array which are used for video quality selection.
+		// It *seems* that media.Document is an original and `media.AltDocuments` are re-encoded versions with lower size.
+		// AltDocuments are also have very similar exif data and media.Document is a bit different from that.
+		// Although *sometimes* there is an entry in AltDocuments which is *bigger* than the media.Document.
+		// (for example, here t.me/android_ru/1630915 Document.Size=637176 and AltDocuments[2].Size=744419)
+		// Why? ¯\_(ツ)_/¯
+		// Saving only the original.
+		fileInfos = append(fileInfos, TGFileInfo{
 			InputLocation: mtproto.TL_inputDocumentFileLocation{
 				ID:            doc.ID,
 				AccessHash:    doc.AccessHash,
@@ -678,7 +729,8 @@ func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName strin
 			DCID:       doc.DCID,
 			FName:      fname,
 			IndexInMsg: indexInMsg,
-		}}, nil
+		})
+		return fileInfos, nil
 	case mtproto.TL_messageMediaStory:
 		if media.Story == nil {
 			return nil, nil
@@ -711,9 +763,42 @@ func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName strin
 	case mtproto.TL_messageMediaUnsupported:
 		log.Error(nil, "media of %s #%d item #%d is insupported, skipping", ctxObjName, ctxObjID, indexInMsg)
 		return nil, nil
+	case mtproto.TL_messageMediaWebPage:
+		switch webPage := media.Webpage.(type) {
+		case mtproto.TL_webPageEmpty:
+			return nil, nil //no URL preview
+		case mtproto.TL_webPagePending:
+			// TODO: re-fetch the message somehow
+			if skipPendingWebpagePhotos {
+				log.Warn("webpage preview image in %s #%d is pending, skipping", ctxObjName, ctxObjID)
+				return nil, nil
+			} else {
+				return nil, merry.Wrap(
+					fmt.Errorf(
+						"tl;dr: webPage preview image in %s #%d is pending, run with -skip-pending-webpage-photos to skip such images."+
+							"\n\nMore details:\n%s",
+						ctxObjName, ctxObjID, skipPendingWebpagePhotosHelp),
+					merry.NoCaptureStack(),
+				)
+			}
+		case mtproto.TL_webPage:
+			if webPage.Photo != nil {
+				fileInfo, found, err := tgFindPhotoFileInfo(webPage.Photo, "webpage_photo.jpg", indexInMsg, "media.webPage", ctxObjName, ctxObjID)
+				if err != nil {
+					return nil, merry.Wrap(err)
+				}
+				if found {
+					return []TGFileInfo{fileInfo}, nil
+				}
+			}
+			return nil, nil
+		default:
+			log.Error(nil, "unexpected webpage %#T in media of %s #%d, skipping",
+				media.Webpage, ctxObjName, ctxObjID)
+			return nil, nil
+		}
 	case mtproto.TL_messageMediaGeo,
 		mtproto.TL_messageMediaContact,
-		mtproto.TL_messageMediaWebPage,
 		mtproto.TL_messageMediaVenue,
 		mtproto.TL_messageMediaGame,
 		mtproto.TL_messageMediaInvoice,
@@ -722,6 +807,8 @@ func tgFindMediaFileInfos(mediaTL mtproto.TL, indexInMsg int64, ctxObjName strin
 		mtproto.TL_messageMediaDice,
 		mtproto.TL_messageMediaGiveaway,
 		mtproto.TL_messageMediaGiveawayResults,
+		mtproto.TL_messageMediaVideoStream,
+		mtproto.TL_messageMediaToDo,
 		nil:
 		// nothing to save here
 		return nil, nil
