@@ -1,4 +1,4 @@
-**Attention!** with update to layer 167, JSON output format got some important changes, [check them out](https://github.com/3bl3gamer/tg_history_dumper/releases/tag/v0.167.0).
+**Attention!** with update to layer 167, JSON output format got some important changes, [check them out](https://github.com/skrashevich/tg_history_dumper/releases/tag/v0.167.0).
 
 # Telegram History Dumper
 
@@ -15,13 +15,13 @@ It **will not fetch channel comments**. If you need them, you should join channe
 ## Installing
 
 ```
-go install github.com/3bl3gamer/tg_history_dumper@latest
+go install github.com/skrashevich/tg_history_dumper@latest
 tg_history_dumper [args]
 ```
 
 Or
 ```
-git clone https://github.com/3bl3gamer/tg_history_dumper
+git clone https://github.com/skrashevich/tg_history_dumper
 cd tg_history_dumper
 go build
 ./tg_history_dumper [args]
